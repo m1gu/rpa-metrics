@@ -35,6 +35,6 @@ python -m pip install -r requirements.txt
 playwright install
 python main.py
 # o especificar el rango dinamico
-python robot_metrc.py --days 180
+python robot_metrc.py --days 30
 ```
 El archivo `test_robot.py` se puede usar como smoke test rapido antes de correr la insercion completa.

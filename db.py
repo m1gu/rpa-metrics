@@ -127,7 +127,8 @@ def _map_row(row: Mapping[str, object]) -> Optional[Dict[str, object]]:
 def _get_str(value: object) -> Optional[str]:
     if value is None:
         return None
-    text = str(value).strip()
+    # Normalize whitespace and drop trailing commas often present in scraped cells.
+    text = str(value).strip().rstrip(",").strip()
     return text or None
 
 
