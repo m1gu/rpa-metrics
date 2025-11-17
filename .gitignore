@@ -1,0 +1,19 @@
+# Python bytecode/cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+env/
+
+# Environment variables / secrets
+.env
+
+# Playwright artifacts
+playwright/.cache/
+test-results/
+debug_grid_*.html
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
