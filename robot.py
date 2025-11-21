@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import re
 import time
 from typing import Dict, List, Mapping, Optional, Union
@@ -59,7 +58,17 @@ class MetrcRobot:
                 self._navigate_to_packages(page)
                 self._dismiss_stonly_widget(page)
                 self._apply_filters(page)
-                return self._extract_table_rows(page)
+                rows = self._extract_table_rows(page)
+                filtered = self._filter_rows_by_date(rows)
+                logger.info(
+                    "Date validation (last %d days): kept %d of %d rows",
+                    self.date_range_days,
+                    len(filtered),
+                    len(rows),
+                )
+                if len(filtered) < len(rows):
+                    logger.warning("Discarded %d rows outside date range.", len(rows) - len(filtered))
+                return filtered
             finally:
                 browser.close()
 
@@ -135,7 +144,7 @@ class MetrcRobot:
         self._dismiss_stonly_widget(page)
         self._apply_status_filter(page)
         self._dismiss_stonly_widget(page)
-        self._apply_date_filter(page)
+        # Date filtering is now handled internally on extracted rows.
 
     def _apply_status_filter(self, page: Page) -> None:
         logger.info("Applying Lab Test Status filter (term '%s').", self.FILTER_TERM)
@@ -157,6 +166,7 @@ class MetrcRobot:
         filter_input.fill(self.FILTER_TERM)
         self._click_filter_button(page, filter_menu)
         self._wait_for_grid_ready(page)
+        self._log_row_count(page, context="after status filter")
 
     def _apply_date_filter(self, page: Page) -> None:
         logger.info(
@@ -178,26 +188,11 @@ class MetrcRobot:
         )
 
         start_date, end_date = self._get_date_range_strings()
-        page.keyboard.press("Tab")  # first select
-        page.wait_for_timeout(50)
-        for _ in range(3):
-            page.keyboard.press("ArrowDown")  # move to After
-            page.wait_for_timeout(50)
-        page.keyboard.press("Tab")  # first date input
-        page.wait_for_timeout(50)
-        page.keyboard.type(start_date)
-        for _ in range(2):
-            page.keyboard.press("Tab")  # move to second select
-            page.wait_for_timeout(50)
-        for _ in range(5):
-            page.keyboard.press("ArrowDown")  # move to Before
-            page.wait_for_timeout(50)
-        page.keyboard.press("Tab")  # second date input
-        page.wait_for_timeout(50)
-        page.keyboard.type(end_date)
+        self._set_date_filter_values(filter_menu, start_date, end_date)
 
         self._click_filter_button(page, filter_menu)
         self._wait_for_grid_ready(page)
+        self._log_row_count(page, context="after date filter")
 
     def _open_filter_popup(
         self,
@@ -222,26 +217,135 @@ class MetrcRobot:
             if not activated:
                 activated = self._click_filter_option_via_js(page)
             if activated:
-                popup = page.locator("div.k-animation-container").filter(
+                popup = page.locator("div.k-animation-container:visible").filter(
                     has=page.locator(input_selector)
                 )
                 if popup.count():
-                    popup.last.wait_for(state="visible", timeout=5_000)
-                    return popup.last
+                    popup.first.wait_for(state="visible", timeout=5_000)
+                    return popup.first
             logger.warning("Filter menu attempt %d failed; retrying.", attempt + 1)
             page.wait_for_timeout(500)
         raise TimeoutError("Unable to activate Filter option after multiple attempts.")
 
     def _click_filter_button(self, page: Page, filter_menu: Locator) -> None:
         filter_button = filter_menu.locator(
-            "button.k-button.k-primary", has_text=re.compile(r"\bFilter\b", re.I)
+            "button.k-button.k-primary:visible", has_text=re.compile(r"\bFilter\b", re.I)
         ).first
         try:
+            filter_button.wait_for(state="visible", timeout=3_000)
             filter_button.click()
         except TimeoutError:
-            logger.warning("Standard click on Filter button failed; retrying with force.")
-            filter_button.click(force=True)
-        page.wait_for_load_state("networkidle")
+            logger.warning("Standard click on Filter button failed; retrying with JS.")
+            handle = filter_button.element_handle()
+            if handle is None:
+                raise
+            page.evaluate("el => el.click()", handle)
+        self._wait_for_network_idle(page)
+
+    def _set_date_filter_values(self, filter_menu: Locator, start_date: str, end_date: str) -> None:
+        # Prefer selecting operators (>=, <=) via the dropdowns if present.
+        operators = filter_menu.locator("select[data-role='dropdownlist']")
+        if operators.count() >= 2:
+            self._select_dropdown_option(operators.nth(0), ["gte", "after", "greater"])
+            self._select_dropdown_option(operators.nth(1), ["lte", "before", "less"])
+
+        date_inputs = filter_menu.locator("input[data-role='datepicker']")
+        if date_inputs.count() < 2:
+            raise TimeoutError("Date inputs not found inside filter menu.")
+
+        start_input = date_inputs.nth(0)
+        end_input = date_inputs.nth(1)
+        start_input.scroll_into_view_if_needed()
+        logger.debug("Setting start date to %s", start_date)
+        start_input.fill(start_date)
+        end_input.scroll_into_view_if_needed()
+        logger.debug("Setting end date to %s", end_date)
+        end_input.fill(end_date)
+        logger.info(
+            "Date inputs filled: start=%s, end=%s",
+            start_input.input_value(),
+            end_input.input_value(),
+        )
+
+    def _select_dropdown_option(self, select_locator: Locator, candidates: List[str]) -> None:
+        # First try the value attribute; then fallback to matching by label text via evaluation.
+        for candidate in candidates:
+            try:
+                select_locator.select_option(value=candidate, timeout=2_000)
+                return
+            except Exception:
+                continue
+        handle = select_locator.element_handle()
+        if handle is None:
+            return
+        handle.evaluate(
+            """
+            (select, labels) => {
+                const lower = labels.map(l => l.toLowerCase());
+                const opts = Array.from(select.options);
+                const match = opts.find(opt => {
+                    const text = (opt.label || opt.textContent || '').toLowerCase();
+                    return lower.some(label => text.includes(label));
+                });
+                if (match) {
+                    select.value = match.value;
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }
+            """,
+            candidates,
+        )
+
+    def _wait_for_network_idle(self, page: Page, timeout_ms: int = 30_000) -> None:
+        try:
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except TimeoutError:
+            logger.warning("Network idle not reached within %d ms; continuing.", timeout_ms)
+
+    def _filter_rows_by_date(self, rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Keep only rows whose 'Date' is within [today - date_range_days, today] inclusive."""
+        if not rows:
+            return rows
+        today = datetime.now(timezone.utc).date()
+        start_date = today - timedelta(days=self.date_range_days)
+        kept: List[Dict[str, str]] = []
+        for row in rows:
+            raw_date = row.get("Date")
+            parsed = self._parse_row_date(raw_date)
+            if parsed is None:
+                logger.debug("Skipping row with unparsable Date: %s", raw_date)
+                continue
+            if start_date <= parsed <= today:
+                kept.append(row)
+            else:
+                logger.debug("Dropping row with Date %s outside range %s - %s", parsed, start_date, today)
+        return kept
+
+    def _parse_row_date(self, value: object) -> Optional[datetime.date]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.split()[0]  # drop time if present
+        try:
+            return datetime.strptime(text, "%m/%d/%Y").date()
+        except ValueError:
+            return None
+
+    def _log_row_count(
+        self,
+        page: Page,
+        *,
+        context: str,
+    ) -> None:
+        try:
+            scope = self._ensure_grid_scope(page)
+            grid_rows = scope.locator("#active-grid table tbody tr[role='row']")
+            row_count = grid_rows.count()
+            logger.info("Row count %s: %d", context, row_count)
+        except Exception:
+            logger.exception("Failed to log row count for context '%s'", context)
 
     def _get_date_range_strings(self) -> tuple[str, str]:
         today = datetime.now(timezone.utc).date()
@@ -399,17 +503,7 @@ class MetrcRobot:
                     continue
             time.sleep(0.5)
 
-        self._dump_debug_snapshot(page)
         raise TimeoutError("Unable to locate the METRC packages grid.")
-
-    def _dump_debug_snapshot(self, page: Page) -> None:
-        try:
-            path = Path(f"debug_grid_{int(time.time())}.html")
-            path.write_text(page.content(), encoding="utf-8")
-            logger.error("Saved debug snapshot to %s for troubleshooting.", path)
-        except Exception:  # pragma: no cover - best effort debug
-            logger.exception("Failed to write debug snapshot.")
-
 
 def get_robot() -> MetrcRobot:
     return MetrcRobot(config=settings.playwright, date_range_days=settings.runtime.date_range_days)

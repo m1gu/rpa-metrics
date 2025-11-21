@@ -66,7 +66,8 @@ def session_scope() -> Iterable[Session]:
 
 def insert_rows(table_name: str, rows: Iterable[Mapping[str, object]]) -> int:
     """
-    Persist rows into PostgreSQL using an UPSERT on (metrc_id, metrc_date, metrc_status).
+    Replace all rows in the target table with the provided rows.
+    Existing data is deleted, then new rows are inserted (UPSERT for safety).
     """
     table = _get_table(table_name)
     payloads: List[Dict[str, object]] = []
@@ -83,7 +84,9 @@ def insert_rows(table_name: str, rows: Iterable[Mapping[str, object]]) -> int:
         logger.warning("Skipped %d rows due to missing mandatory fields.", skipped)
 
     if not payloads:
-        logger.info("No valid rows to persist.")
+        with session_scope() as session:
+            session.execute(table.delete())
+        logger.info("No valid rows; table %s cleared and left empty.", table_name)
         return 0
 
     insert_stmt = insert(table).values(payloads)
@@ -96,9 +99,10 @@ def insert_rows(table_name: str, rows: Iterable[Mapping[str, object]]) -> int:
     )
 
     with session_scope() as session:
+        session.execute(table.delete())
         session.execute(stmt)
         rowcount = len(payloads)
-        logger.info("Persisted %d rows into %s.", rowcount, table_name)
+        logger.info("Replaced rows in %s (inserted %d after clearing table).", table_name, rowcount)
         return rowcount
 
 
