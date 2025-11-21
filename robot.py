@@ -45,6 +45,7 @@ class MetrcRobot:
         self.config = config
         self._grid_scope: Optional[Scope] = None
         self.date_range_days = max(1, date_range_days)
+        self.max_tag_filter_retries = 3
 
     def fetch_table_rows(self) -> List[Dict[str, str]]:
         """Main entrypoint for the robot."""
@@ -68,7 +69,15 @@ class MetrcRobot:
                 )
                 if len(filtered) < len(rows):
                     logger.warning("Discarded %d rows outside date range.", len(rows) - len(filtered))
-                return filtered
+                filtered_testing = [
+                    row for row in filtered if (row.get("LT Status") or "").strip() == "TestingInProgress"
+                ]
+                logger.info(
+                    "TestingInProgress filter: kept %d of %d rows after date check.",
+                    len(filtered_testing),
+                    len(filtered),
+                )
+                return filtered_testing
             finally:
                 browser.close()
 
@@ -332,6 +341,103 @@ class MetrcRobot:
             return datetime.strptime(text, "%m/%d/%Y").date()
         except ValueError:
             return None
+
+    # --- Secondary routine: verify and update statuses by Tag ---
+
+    def verify_status_by_tag(self, records: List[Mapping[str, object]]) -> List[Dict[str, object]]:
+        """
+        For each record, apply a Tag equals filter, fetch LT Status, and return results.
+        """
+        if not records:
+            return []
+
+        outcomes: List[Dict[str, object]] = []
+        self._grid_scope = None
+        with sync_playwright() as playwright:
+            browser = self._launch_browser(playwright)
+            page = browser.new_page()
+            try:
+                self._open_base_url(page)
+                self._login_if_needed(page)
+                self._navigate_to_packages(page)
+                self._dismiss_stonly_widget(page)
+                for record in records:
+                    metrc_id = (record.get("Tag") or "").strip()
+                    current_status = (record.get("LT Status") or "").strip()
+                    if not metrc_id:
+                        logger.warning("Skipping record with empty Tag.")
+                        continue
+                    outcome = self._verify_single_tag(page, metrc_id, current_status)
+                    outcomes.append(outcome)
+                return outcomes
+            finally:
+                browser.close()
+
+    def _verify_single_tag(self, page: Page, metrc_id: str, current_status: str) -> Dict[str, object]:
+        for attempt in range(1, self.max_tag_filter_retries + 1):
+            self._apply_tag_filter(page, metrc_id)
+            scope = self._ensure_grid_scope(page)
+            rows = scope.locator("#active-grid table tbody tr[role='row']")
+            count = rows.count()
+            logger.info("Tag %s attempt %d: row count %d", metrc_id, attempt, count)
+            if count == 1:
+                lt_status = self._get_cell_text(rows.nth(0), self.COLUMN_MAP["LT Status"])
+                lt_status = lt_status.strip()
+                return {
+                    "metrc_id": metrc_id,
+                    "current_status": current_status,
+                    "fetched_status": lt_status,
+                    "changed": lt_status != current_status,
+                    "attempts": attempt,
+                    "success": True,
+                }
+            if count > 1:
+                lt_status = self._get_cell_text(rows.nth(0), self.COLUMN_MAP["LT Status"]).strip()
+                return {
+                    "metrc_id": metrc_id,
+                    "current_status": current_status,
+                    "fetched_status": lt_status,
+                    "changed": lt_status != current_status,
+                    "attempts": attempt,
+                    "success": True,
+                    "note": f"Multiple rows ({count}), used first.",
+                }
+        logger.error("Tag %s: no rows after %d attempts.", metrc_id, self.max_tag_filter_retries)
+        return {
+            "metrc_id": metrc_id,
+            "current_status": current_status,
+            "fetched_status": None,
+            "changed": False,
+            "attempts": self.max_tag_filter_retries,
+            "success": False,
+        }
+
+    def _apply_tag_filter(self, page: Page, metrc_id: str) -> None:
+        logger.info("Applying Tag equals filter for %s", metrc_id)
+        scope = self._ensure_grid_scope(page)
+        column_header = scope.locator(
+            "#active-grid thead.k-grid-header th[data-field='Label']"
+        ).first
+        column_header.wait_for(state="visible", timeout=10_000)
+
+        filter_menu = self._open_filter_popup(
+            page,
+            column_header,
+            input_selector="input[type='text']",
+            tab_presses=0,
+            allow_keyboard=True,
+        )
+
+        operators = filter_menu.locator("select[data-role='dropdownlist']")
+        if operators.count() >= 1:
+            self._select_dropdown_option(operators.nth(0), ["eq", "equals", "equal", "is equal to"])
+
+        input_box = filter_menu.locator("input[type='text']").first
+        input_box.scroll_into_view_if_needed()
+        input_box.fill(metrc_id)
+
+        self._click_filter_button(page, filter_menu)
+        self._wait_for_grid_ready(page)
 
     def _log_row_count(
         self,

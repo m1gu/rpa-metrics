@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Dict, Iterable, List, Mapping, Optional
 
-from sqlalchemy import Column, Date, DateTime, Integer, MetaData, String, Table, create_engine, func
+from sqlalchemy import Column, Date, DateTime, Integer, MetaData, String, Table, create_engine, func, select
 from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -66,43 +66,44 @@ def session_scope() -> Iterable[Session]:
 
 def insert_rows(table_name: str, rows: Iterable[Mapping[str, object]]) -> int:
     """
-    Replace all rows in the target table with the provided rows.
-    Existing data is deleted, then new rows are inserted (UPSERT for safety).
+    Insert only new metrc_id values; existing metrc_id rows are skipped.
     """
     table = _get_table(table_name)
     payloads: List[Dict[str, object]] = []
     skipped = 0
-
-    for row in rows:
-        mapped = _map_row(row)
-        if mapped is None:
-            skipped += 1
-            continue
-        payloads.append(mapped)
-
-    if skipped:
-        logger.warning("Skipped %d rows due to missing mandatory fields.", skipped)
-
-    if not payloads:
-        with session_scope() as session:
-            session.execute(table.delete())
-        logger.info("No valid rows; table %s cleared and left empty.", table_name)
-        return 0
-
-    insert_stmt = insert(table).values(payloads)
-    stmt = insert_stmt.on_conflict_do_update(
-        index_elements=["metrc_id", "metrc_date", "metrc_status"],
-        set_={
-            "raw_payload": insert_stmt.excluded.raw_payload,
-            "status_fetched_at": func.now(),
-        },
-    )
+    duplicates = 0
 
     with session_scope() as session:
-        session.execute(table.delete())
-        session.execute(stmt)
-        rowcount = len(payloads)
-        logger.info("Replaced rows in %s (inserted %d after clearing table).", table_name, rowcount)
+        existing_ids = {
+            row[0]
+            for row in session.execute(select(table.c.metrc_id))
+        }
+
+        for row in rows:
+            mapped = _map_row(row)
+            if mapped is None:
+                skipped += 1
+                continue
+            if mapped["metrc_id"] in existing_ids:
+                duplicates += 1
+                continue
+            payloads.append(mapped)
+
+        if skipped:
+            logger.warning("Skipped %d rows due to missing mandatory fields.", skipped)
+        if duplicates:
+            logger.info("Skipped %d rows because metrc_id already existed.", duplicates)
+
+        if not payloads:
+            logger.info("No new rows to insert into %s.", table_name)
+            return 0
+
+        insert_stmt = insert(table).values(payloads)
+        stmt = insert_stmt.on_conflict_do_nothing(index_elements=["metrc_id"])
+
+        result = session.execute(stmt)
+        rowcount = result.rowcount if result is not None else 0
+        logger.info("Inserted %d new rows into %s.", rowcount, table_name)
         return rowcount
 
 
@@ -148,3 +149,42 @@ def _parse_date(value: object) -> Optional[date]:
     except ValueError:
         logger.warning("Unable to parse date '%s' with format %s", text, DATE_FORMAT)
         return None
+
+
+def update_status(table_name: str, metrc_id: str, new_status: str) -> int:
+    """
+    Update metrc_status and status_fetched_at for a given metrc_id.
+    """
+    table = _get_table(table_name)
+    stmt = (
+        table.update()
+        .where(table.c.metrc_id == metrc_id)
+        .values(metrc_status=new_status, status_fetched_at=func.now())
+    )
+    with session_scope() as session:
+        result = session.execute(stmt)
+        updated = result.rowcount if result is not None else 0
+        if updated:
+            logger.info("Updated status for metrc_id %s to %s.", metrc_id, new_status)
+        else:
+            logger.warning("No rows updated for metrc_id %s.", metrc_id)
+        return updated
+
+
+def fetch_all_rows(table_name: str) -> List[Dict[str, object]]:
+    """
+    Fetch all rows (metrc_id, metrc_status, metrc_date) from the table.
+    """
+    table = _get_table(table_name)
+    with session_scope() as session:
+        result = session.execute(
+            select(table.c.metrc_id, table.c.metrc_status, table.c.metrc_date)
+        )
+        return [
+            {
+                "metrc_id": row.metrc_id,
+                "metrc_status": row.metrc_status,
+                "metrc_date": row.metrc_date,
+            }
+            for row in result.fetchall()
+        ]
