@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from src.cli.metrc import main
+from src.services.pipeline import run
+
+
+def main() -> None:
+    run()
 
 
 if __name__ == "__main__":
