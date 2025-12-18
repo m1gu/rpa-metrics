@@ -150,7 +150,9 @@ class MetrcRobot:
         self._wait_for_grid_ready(page)
 
     def _apply_filters(self, page: Page) -> None:
+        self._dismiss_csv_templates_popup(page)
         self._dismiss_stonly_widget(page)
+        self._dismiss_system_alerts(page)
         self._apply_status_filter(page)
         self._dismiss_stonly_widget(page)
         # Date filtering is now handled internally on extracted rows.
@@ -213,9 +215,23 @@ class MetrcRobot:
         allow_keyboard: bool,
     ) -> Locator:
         menu_button = column_header.locator("a.k-header-column-menu").first
-        for attempt in range(3):
-            menu_button.click()
-            page.wait_for_timeout(200)
+        for attempt in range(6):
+            self._dismiss_csv_templates_popup(page)
+            self._dismiss_csv_templates_popup(page)
+            self._dismiss_stonly_widget(page)
+            self._dismiss_system_alerts(page)
+            try:
+                menu_button.scroll_into_view_if_needed(timeout=2_000)
+            except Exception:
+                logger.debug("Scroll into view failed for column menu; continuing.")
+            try:
+                menu_button.click(timeout=2_000, force=True)
+            except Exception:
+                logger.warning("Standard click on column menu failed; retrying with JS.")
+                handle = menu_button.element_handle()
+                if handle is not None:
+                    page.evaluate("el => el.click()", handle)
+            page.wait_for_timeout(400)
             activated = False
             if allow_keyboard:
                 activated = self._select_filter_via_keyboard(
@@ -226,14 +242,13 @@ class MetrcRobot:
             if not activated:
                 activated = self._click_filter_option_via_js(page)
             if activated:
-                popup = page.locator("div.k-animation-container:visible").filter(
-                    has=page.locator(input_selector)
-                )
+                popup_container = page.locator("div.k-animation-container:visible")
+                popup = popup_container.filter(has=page.locator(input_selector))
                 if popup.count():
-                    popup.first.wait_for(state="visible", timeout=5_000)
-                    return popup.first
-            logger.warning("Filter menu attempt %d failed; retrying.", attempt + 1)
-            page.wait_for_timeout(500)
+                    target = popup.first
+                    target.wait_for(state="visible", timeout=5_000)
+                    return target
+            page.wait_for_timeout(700)
         raise TimeoutError("Unable to activate Filter option after multiple attempts.")
 
     def _click_filter_button(self, page: Page, filter_menu: Locator) -> None:
@@ -241,14 +256,22 @@ class MetrcRobot:
             "button.k-button.k-primary:visible", has_text=re.compile(r"\bFilter\b", re.I)
         ).first
         try:
-            filter_button.wait_for(state="visible", timeout=3_000)
+            filter_button.wait_for(state="visible", timeout=5_000)
             filter_button.click()
         except TimeoutError:
             logger.warning("Standard click on Filter button failed; retrying with JS.")
-            handle = filter_button.element_handle()
-            if handle is None:
+            popup_handle = filter_menu.element_handle(timeout=5_000)
+            if popup_handle is None:
                 raise
-            page.evaluate("el => el.click()", handle)
+            page.evaluate(
+                """
+                popup => {
+                    const btn = popup.querySelector('button.k-button.k-primary');
+                    if (btn) { btn.click(); }
+                }
+                """,
+                popup_handle,
+            )
         self._wait_for_network_idle(page)
 
     def _set_date_filter_values(self, filter_menu: Locator, start_date: str, end_date: str) -> None:
@@ -360,6 +383,7 @@ class MetrcRobot:
                 self._open_base_url(page)
                 self._login_if_needed(page)
                 self._navigate_to_packages(page)
+                self._dismiss_csv_templates_popup(page)
                 self._dismiss_stonly_widget(page)
                 for record in records:
                     metrc_id = (record.get("Tag") or "").strip()
@@ -414,6 +438,8 @@ class MetrcRobot:
 
     def _apply_tag_filter(self, page: Page, metrc_id: str) -> None:
         logger.info("Applying Tag equals filter for %s", metrc_id)
+        self._dismiss_csv_templates_popup(page)
+        self._dismiss_stonly_widget(page)
         scope = self._ensure_grid_scope(page)
         column_header = scope.locator(
             "#active-grid thead.k-grid-header th[data-field='Label']"
@@ -433,8 +459,26 @@ class MetrcRobot:
             self._select_dropdown_option(operators.nth(0), ["eq", "equals", "equal", "is equal to"])
 
         input_box = filter_menu.locator("input[type='text']").first
-        input_box.scroll_into_view_if_needed()
-        input_box.fill(metrc_id)
+        filled = False
+        try:
+            input_box.scroll_into_view_if_needed(timeout=2_000)
+            try:
+                input_box.fill("", timeout=1_000)
+            except Exception:
+                pass
+            input_box.fill(metrc_id, timeout=3_000)
+            filled = True
+        except Exception:
+            logger.warning("Standard fill failed for tag filter input; retrying with JS.")
+            handle = input_box.element_handle()
+            if handle is not None:
+                handle.evaluate(
+                    "(el, value) => { el.value = value; el.dispatchEvent(new Event('input', {bubbles:true})); }",
+                    metrc_id,
+                )
+                filled = True
+        if not filled:
+            raise TimeoutError("Unable to set Tag filter input.")
 
         self._click_filter_button(page, filter_menu)
         self._wait_for_grid_ready(page)
@@ -561,6 +605,49 @@ class MetrcRobot:
             return
         page.add_style_tag(content=".stn-wdgt { display: none !important; }")
 
+    def _dismiss_csv_templates_popup(self, page: Page) -> None:
+        """
+        Close the new CSV Templates modal that blocks the grid (button text 'Got It').
+        """
+        candidate_buttons: List[Locator] = [
+            page.get_by_role("button", name=re.compile(r"\bGot\s*It\b", re.I)),
+            page.locator("div.Button__StyledButtonInterior-sc-3ecdced5-4", has_text=re.compile(r"\bGot\s*It\b", re.I)),
+            page.locator("button", has_text=re.compile(r"\bGot\s*It\b", re.I)),
+        ]
+        button = self._first_visible_locator(candidate_buttons, timeout=3_000)
+        if button is None:
+            return
+        try:
+            button.click(timeout=2_000)
+            logger.info("Dismissed CSV Templates modal (Got It).")
+        except Exception:
+            logger.warning("Standard click failed on CSV Templates modal; retrying with JS.")
+            handle = button.element_handle()
+            if handle is not None:
+                page.evaluate("el => el.click()", handle)
+
+    def _dismiss_system_alerts(self, page: Page) -> None:
+        """
+        Dismiss yellow/red system alerts that block the UI.
+        Selectors based on 'data-donotshow-cookiename' attributes.
+        """
+        # 1. MetrcHideNotificationAlert (Yellow)
+        # 2. MetrcPackagesHideOnHoldNotice (Red)
+        alert_close_buttons = page.locator("span[data-dismiss='alert'][data-donotshow-cookiename]")
+        count = alert_close_buttons.count()
+        if count > 0:
+            logger.info("Found %d system alert(s) to dismiss.", count)
+            # Iterate in reverse or just click all visible
+            for i in range(count):
+                btn = alert_close_buttons.nth(i)
+                if btn.is_visible():
+                    try:
+                        btn.click(timeout=2000)
+                        logger.info("Clicked system alert dismiss button.")
+                        page.wait_for_timeout(500)  # wait for animation
+                    except Exception:
+                        logger.warning("Failed to dismiss a system alert.")
+
     def _wait_for_grid_ready(self, page: Page) -> None:
         scope = self._ensure_grid_scope(page)
         panel = scope.locator("#packages_tabstrip-1")
@@ -614,4 +701,3 @@ class MetrcRobot:
 
 def get_robot() -> MetrcRobot:
     return MetrcRobot(config=settings.playwright, date_range_days=settings.runtime.date_range_days)
-

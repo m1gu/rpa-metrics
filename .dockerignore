@@ -1,0 +1,17 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+.env.*
+.venv/
+venv/
+dist/
+build/
+.cache/
+.pytest_cache/
+.playwright-cache/
+playwright-report/
