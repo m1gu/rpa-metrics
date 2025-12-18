@@ -163,7 +163,7 @@ class MetrcRobot:
         column_header = scope.locator(
             "#active-grid thead.k-grid-header th[data-field='LabTestingStateName']"
         ).first
-        column_header.wait_for(state="visible", timeout=10_000)
+        column_header.wait_for(state="visible", timeout=30_000)
 
         filter_menu = self._open_filter_popup(
             page,
@@ -188,7 +188,7 @@ class MetrcRobot:
         column_header = scope.locator(
             "#active-grid thead.k-grid-header th[data-field='PackagedDate']"
         ).first
-        column_header.wait_for(state="visible", timeout=10_000)
+        column_header.wait_for(state="visible", timeout=30_000)
 
         filter_menu = self._open_filter_popup(
             page,
@@ -444,7 +444,7 @@ class MetrcRobot:
         column_header = scope.locator(
             "#active-grid thead.k-grid-header th[data-field='Label']"
         ).first
-        column_header.wait_for(state="visible", timeout=10_000)
+        column_header.wait_for(state="visible", timeout=30_000)
 
         filter_menu = self._open_filter_popup(
             page,
