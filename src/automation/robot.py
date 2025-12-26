@@ -391,7 +391,32 @@ class MetrcRobot:
                     if not metrc_id:
                         logger.warning("Skipping record with empty Tag.")
                         continue
-                    outcome = self._verify_single_tag(page, metrc_id, current_status)
+                    
+                    try:
+                        outcome = self._verify_single_tag(page, metrc_id, current_status)
+                    except Exception as e:
+                        logger.warning("Error verifying tag %s: %s. Attempting session recovery...", metrc_id, e)
+                        try:
+                            # Attempt to restore session and navigating back
+                            self._login_if_needed(page)
+                            self._navigate_to_packages(page)
+                            self._dismiss_csv_templates_popup(page)
+                            self._dismiss_stonly_widget(page)
+                            self._dismiss_system_alerts(page)
+                            
+                            logger.info("Retrying tag %s after session recovery.", metrc_id)
+                            outcome = self._verify_single_tag(page, metrc_id, current_status)
+                        except Exception as retry_exc:
+                            logger.error("Failed to recover and verify tag %s: %s", metrc_id, retry_exc)
+                            outcome = {
+                                "metrc_id": metrc_id,
+                                "current_status": current_status,
+                                "fetched_status": None,
+                                "changed": False,
+                                "attempts": 0,
+                                "success": False,
+                                "error": str(retry_exc),
+                            }
                     outcomes.append(outcome)
                 return outcomes
             finally:
@@ -404,9 +429,22 @@ class MetrcRobot:
             rows = scope.locator("#active-grid table tbody tr[role='row']")
             count = rows.count()
             logger.info("Tag %s attempt %d: row count %d", metrc_id, attempt, count)
-            if count == 1:
-                lt_status = self._get_cell_text(rows.nth(0), self.COLUMN_MAP["LT Status"])
-                lt_status = lt_status.strip()
+            if count >= 1:
+                # Security Validation: Verify the actual Tag in the row matches what we filtered for.
+                # This prevents "Ghost Data" if the filter input was ignored or lagged.
+                first_row = rows.nth(0)
+                # Strip spaces and commas explicitly (some views render "TAG ," or "TAG ")
+                visible_tag = self._get_cell_text(first_row, self.COLUMN_MAP["Tag"]).strip(" ,")
+                
+                if visible_tag.lower() != metrc_id.lower():
+                    logger.warning(
+                        "Tag mismatch! Filter target '%s' vs Grid detected '%s'. Possible filter failure. Retrying...", 
+                        metrc_id, visible_tag
+                    )
+                    # Force a short wait or reload could be added here, but the loop retry will handle it.
+                    continue
+
+                lt_status = self._get_cell_text(first_row, self.COLUMN_MAP["LT Status"]).strip()
                 return {
                     "metrc_id": metrc_id,
                     "current_status": current_status,
@@ -414,19 +452,10 @@ class MetrcRobot:
                     "changed": lt_status != current_status,
                     "attempts": attempt,
                     "success": True,
+                    "note": f"Verified row match (found {count} rows)." if count > 1 else None,
                 }
-            if count > 1:
-                lt_status = self._get_cell_text(rows.nth(0), self.COLUMN_MAP["LT Status"]).strip()
-                return {
-                    "metrc_id": metrc_id,
-                    "current_status": current_status,
-                    "fetched_status": lt_status,
-                    "changed": lt_status != current_status,
-                    "attempts": attempt,
-                    "success": True,
-                    "note": f"Multiple rows ({count}), used first.",
-                }
-        logger.error("Tag %s: no rows after %d attempts.", metrc_id, self.max_tag_filter_retries)
+        
+        logger.error("Tag %s: no matching rows after %d attempts.", metrc_id, self.max_tag_filter_retries)
         return {
             "metrc_id": metrc_id,
             "current_status": current_status,
